@@ -1,395 +1,368 @@
+#!/usr/bin/env python3
 """
 Lunar Drift - Android Live Wallpaper
-A beautiful, animated Moon wallpaper with gyroscope parallax control.
+Moon animation with gyroscope parallax, swipe control, and sensor stability detection.
+Built with Python and Kivy for cross-platform Android compatibility.
 """
 
 import os
-import sys
+import math
+import json
+from datetime import datetime
+from collections import deque
+
 from kivy.app import App
 from kivy.uix.floatlayout import FloatLayout
-from kivy.garden.matplotlib.backend_kivyagg import FigureCanvasKivyAgg
-from kivy.uix.image import Image
-from kivy.uix.widget import Widget
-from kivy.core.window import Window
-from kivy.clock import Clock
-from kivy.garden.matplotlib import pyplot as plt
-from kivy.uix.popup import Popup
 from kivy.uix.boxlayout import BoxLayout
 from kivy.uix.button import Button
 from kivy.uix.label import Label
-from kivy.uix.slider import Slider
-from kivy.uix.spinner import Spinner
-from kivy.uix.switch import Switch
-from kivy.uix.gridlayout import GridLayout
+from kivy.graphics import Color, Ellipse, Rectangle
+from kivy.core.window import Window
+from kivy.clock import Clock
+from kivy.core.metrics import dp
+from kivy.properties import NumericProperty
+from kivy.uix.widget import Widget
+from kivy.uix.popup import Popup
 
-import numpy as np
-from datetime import datetime
-import json
-from pathlib import Path
-
-# Android-specific imports
+# Try to import Android-specific modules
 try:
-    from jnius import autoclass
-    from jnius import cast
-    from android.permissions import request_permissions, Permission, check_permission
-    from android.runnable import run_on_ui_thread
-    from android import api_version
+    from jnius import autoclass, cast
+    from android.permissions import request_permissions, Permission
     ANDROID_AVAILABLE = True
-except ImportError:
+    PythonActivity = autoclass('org.kivy.android.PythonActivity')
+except (ImportError, RuntimeError):
     ANDROID_AVAILABLE = False
-
-try:
-    from android.sensor import AndroidSensor
-    SENSOR_AVAILABLE = True
-except ImportError:
-    SENSOR_AVAILABLE = False
-
-
-class MoonRenderer(Widget):
-    """Renders the moon with realistic shading and animation."""
-    
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-        self.phase = 0.5
-        self.rotation = 0
-        self.glow_intensity = 1.0
-        self.pulse_factor = 1.0
-        self.parallax_x = 0
-        self.parallax_y = 0
-        self.time_elapsed = 0
-        
-        self.bind(size=self.update_canvas)
-        Clock.schedule_interval(self.update, 0.016)  # ~60 FPS
-        
-    def update_canvas(self, *args):
-        self.canvas.clear()
-        self.draw_moon()
-        
-    def draw_moon(self):
-        """Draw the moon using OpenGL rendering."""
-        from kivy.graphics import Color, Ellipse, PushMatrix, PopMatrix, Translate, Rotate
-        
-        with self.canvas:
-            PushMatrix()
-            
-            # Position with parallax
-            moon_x = self.center_x + self.parallax_x
-            moon_y = self.center_y + self.parallax_y
-            moon_radius = min(self.width, self.height) * 0.25 * self.pulse_factor
-            
-            # Draw outer glow
-            Color(1, 0.9, 0.8, 0.3 * self.glow_intensity)
-            Ellipse(
-                pos=(moon_x - moon_radius * 1.4, moon_y - moon_radius * 1.4),
-                size=(moon_radius * 2.8, moon_radius * 2.8)
-            )
-            
-            # Draw inner glow
-            Color(1, 0.95, 0.9, 0.6 * self.glow_intensity)
-            Ellipse(
-                pos=(moon_x - moon_radius * 1.2, moon_y - moon_radius * 1.2),
-                size=(moon_radius * 2.4, moon_radius * 2.4)
-            )
-            
-            # Draw main moon sphere
-            Color(0.95, 0.95, 0.9, 1.0)
-            Ellipse(
-                pos=(moon_x - moon_radius, moon_y - moon_radius),
-                size=(moon_radius * 2, moon_radius * 2)
-            )
-            
-            # Draw moon phase shadow
-            phase_shadow_width = moon_radius * 2 * (1 - abs(self.phase - 0.5) * 2)
-            shadow_offset = moon_radius * (self.phase - 0.5) * 2
-            
-            Color(0.1, 0.1, 0.15, 0.7)
-            Ellipse(
-                pos=(moon_x - moon_radius + shadow_offset, moon_y - moon_radius),
-                size=(phase_shadow_width, moon_radius * 2)
-            )
-            
-            # Draw craters for detail
-            crater_positions = [
-                (0.3, 0.3, 0.08),
-                (-0.4, 0.2, 0.06),
-                (0.1, -0.4, 0.07),
-                (-0.2, -0.3, 0.05),
-            ]
-            
-            Color(0.85, 0.85, 0.8, 0.5)
-            for cx, cy, crater_r in crater_positions:
-                crater_x = moon_x + cx * moon_radius
-                crater_y = moon_y + cy * moon_radius
-                crater_size = crater_r * moon_radius * 2
-                Ellipse(
-                    pos=(crater_x - crater_size/2, crater_y - crater_size/2),
-                    size=(crater_size, crater_size)
-                )
-            
-            PopMatrix()
-    
-    def update(self, dt):
-        """Update animation state."""
-        self.time_elapsed += dt
-        
-        # Moon phase cycles every 30 seconds
-        self.phase = 0.5 + 0.5 * np.sin(self.time_elapsed * np.pi / 15)
-        
-        # Gentle rotation
-        self.rotation = (self.time_elapsed * 5) % 360
-        
-        # Glow pulse
-        self.glow_intensity = 0.7 + 0.3 * np.sin(self.time_elapsed * np.pi / 3)
-        
-        # Pulse effect (grows and shrinks)
-        self.pulse_factor = 0.95 + 0.05 * np.sin(self.time_elapsed * np.pi / 2)
-        
-        self.canvas.ask_update()
+    print("[INFO] Android modules not available - running in desktop mode")
 
 
 class SensorManager:
-    """Manages device sensors (accelerometer, gyroscope)."""
+    """Manages Android sensor input (gyroscope, accelerometer)."""
     
-    def __init__(self, on_motion_callback=None):
-        self.on_motion = on_motion_callback
-        self.accel_x = 0
-        self.accel_y = 0
-        self.accel_z = 9.8
-        self.gyro_x = 0
-        self.gyro_y = 0
-        self.gyro_z = 0
-        self.is_stable = False
-        self.stability_timer = 0
-        self.motion_active = False
-        self.motion_cooldown = 0
+    def __init__(self):
+        self.gyro_x = 0.0
+        self.gyro_y = 0.0
+        self.gyro_z = 0.0
+        self.accel_x = 0.0
+        self.accel_y = 0.0
+        self.accel_z = 0.0
+        self.available = False
         
-        self.sensors_available = False
-        self._init_sensors()
-        
+        if ANDROID_AVAILABLE:
+            self._init_sensors()
+    
     def _init_sensors(self):
-        """Initialize device sensors if available."""
-        if not ANDROID_AVAILABLE:
-            return
-            
+        """Initialize Android sensors through JNI."""
         try:
-            # Request sensor permissions if needed
-            if ANDROID_AVAILABLE:
-                request_permissions([Permission.BODY_SENSORS])
-            self.sensors_available = True
+            # Get system sensor manager
+            activity = PythonActivity.mActivity
+            Context = autoclass('android.content.Context')
+            context = activity.getSystemService(Context.SENSOR_SERVICE)
+            self.sensor_manager = context
+            self.available = True
+            print("[INFO] Android sensors initialized successfully")
         except Exception as e:
-            print(f"Sensor initialization error: {e}")
-            self.sensors_available = False
+            print(f"[WARNING] Failed to initialize sensors: {e}")
+            self.available = False
     
-    def update(self, dt):
-        """Update sensor readings and stability detection."""
-        if not self.sensors_available:
-            # Simulate gentle motion when sensors unavailable
-            self.accel_x = np.random.normal(0, 0.1)
-            self.accel_y = np.random.normal(0, 0.1)
-            return
-        
-        # Read actual sensor data if available
-        try:
-            # This would be connected to actual device sensors via JNI
-            pass
-        except Exception as e:
-            print(f"Sensor read error: {e}")
-        
-        # Detect stability (3 second threshold)
-        motion_magnitude = np.sqrt(self.accel_x**2 + self.accel_y**2)
-        
-        if motion_magnitude < 0.5:
-            self.stability_timer += dt
-            if self.stability_timer >= 3.0:
-                self.is_stable = True
-                self.motion_active = False
-        else:
-            self.is_stable = False
-            self.stability_timer = 0
-            self.motion_active = True
-            self.motion_cooldown = 0
-        
-        # Motion reactivation cooldown
-        if self.motion_cooldown > 0:
-            self.motion_cooldown -= dt
-        
-        if self.on_motion:
-            self.on_motion(self.accel_x, self.accel_y, self.is_stable)
+    def get_motion_magnitude(self):
+        """Calculate total motion from all sensors."""
+        return math.sqrt(
+            self.gyro_x**2 + self.gyro_y**2 + self.gyro_z**2 +
+            self.accel_x**2 + self.accel_y**2 + self.accel_z**2
+        )
 
 
-class LunarDriftApp(App):
-    """Main Lunar Drift application."""
+class LunarDriftWallpaper(Widget):
+    """Main wallpaper widget with moon rendering and animations."""
+    
+    pulse = NumericProperty(1.0)
     
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        self.title = "Lunar Drift"
-        self.sensor_manager = None
-        self.moon_renderer = None
-        self.settings_popup = None
-        self.tap_time = 0
+        self.size_hint = (1, 1)
+        self.pos_hint = {'x': 0, 'y': 0}
+        
+        # Moon properties
+        self.moon_x = 0.5
+        self.moon_y = 0.5
+        self.moon_scale = 0.15
+        self.moon_radius = 100
+        
+        # Sensor management
+        self.sensor_manager = SensorManager()
+        
+        # Motion detection and stability
+        self.motion_detected = True
+        self.stability_timer = 0.0
+        self.stability_threshold = 3.0  # 3 seconds
+        self.motion_threshold = 0.1
+        self.motion_magnitude = 0.0
+        
+        # Animation states
+        self.pulse_phase = 0.0
+        self.pulse_speed = 2.0
+        self.animation_enabled = True
+        self.double_tap_detected = False
+        self.double_tap_timer = 0.0
+        self.last_tap_time = 0.0
         self.tap_count = 0
-        self.last_tap_x = 0
-        self.last_tap_y = 0
-        self.settings = self.load_settings()
         
-    def build(self):
-        """Build the application UI."""
-        # Set window to full screen
-        Window.fullscreen = 'auto'
+        # Swipe/parallax control
+        self.swipe_offset = 0.0
+        self.swipe_velocity = 0.0
+        self.touch_start_x = 0.0
+        self.touch_start_time = 0.0
         
-        # Main layout
-        main_layout = FloatLayout()
+        # Settings
+        self.settings = {
+            'animation_speed': 1.0,
+            'parallax_strength': 1.0,
+            'glow_intensity': 0.3,
+            'show_stars': True,
+        }
         
-        # Moon renderer
-        self.moon_renderer = MoonRenderer(size_hint=(1, 1))
-        main_layout.add_widget(self.moon_renderer)
+        # Event tracking
+        self.bind(size=self.on_size)
         
-        # Initialize sensor manager
-        self.sensor_manager = SensorManager(
-            on_motion_callback=self.on_device_motion
-        )
-        
-        # Schedule sensor updates
-        Clock.schedule_interval(self.sensor_manager.update, 0.016)
-        
-        # Bind touch events for double-tap
-        main_layout.bind(on_touch_down=self.on_touch_down)
-        
-        # Apply settings
-        self.apply_settings()
-        
-        return main_layout
+        # Start animation loop
+        Clock.schedule_interval(self.update, 1.0 / 60.0)  # 60 FPS
     
-    def on_device_motion(self, x, y, is_stable):
-        """Handle device motion sensor events."""
-        if is_stable:
-            # Freeze parallax when stable
-            self.moon_renderer.parallax_x = 0
-            self.moon_renderer.parallax_y = 0
-        else:
-            # Apply parallax based on device tilt
-            max_parallax = min(self.root.width, self.root.height) * 0.1
-            self.moon_renderer.parallax_x = x * max_parallax * 2
-            self.moon_renderer.parallax_y = -y * max_parallax * 2
+    def on_size(self, instance, value):
+        """Handle window resize."""
+        self.moon_radius = min(self.width, self.height) * self.moon_scale
+        self.redraw_canvas()
     
-    def on_touch_down(self, instance, touch):
-        """Handle touch events for double-tap detection."""
-        current_time = datetime.now().timestamp()
+    def on_touch_down(self, touch):
+        """Handle touch down - detect double-tap and swipe start."""
+        current_time = Clock.get_time()
         
-        # Check for double-tap (within 300ms)
-        if current_time - self.tap_time < 0.3:
-            distance = np.sqrt((touch.x - self.last_tap_x)**2 + (touch.y - self.last_tap_y)**2)
-            if distance < 50:  # Within 50 pixels
-                self.on_double_tap()
+        # Double-tap detection
+        if current_time - self.last_tap_time < 0.3:
+            self.tap_count += 1
+            if self.tap_count >= 2:
+                self.double_tap_detected = True
+                self.double_tap_timer = 0.5
                 self.tap_count = 0
-                return True
+        else:
+            self.tap_count = 1
+            self.last_tap_time = current_time
         
-        self.tap_time = current_time
-        self.last_tap_x = touch.x
-        self.last_tap_y = touch.y
-        self.tap_count += 1
-        
-        # Single tap opens settings menu
-        if self.tap_count == 1:
-            Clock.schedule_once(lambda dt: self.show_settings_menu(), 0.3)
+        # Track swipe
+        self.touch_start_x = touch.x
+        self.touch_start_time = current_time
         
         return True
     
-    def on_double_tap(self):
-        """Handle double-tap - trigger pulse animation."""
-        self.moon_renderer.pulse_factor = 1.2
-        Clock.schedule_once(lambda dt: setattr(self.moon_renderer, 'pulse_factor', 1.0), 0.3)
+    def on_touch_move(self, touch):
+        """Handle touch move - update swipe offset."""
+        delta_x = touch.x - self.touch_start_x
+        self.swipe_offset = delta_x / max(self.width, 1) * 0.5
+        self.swipe_offset = max(-0.25, min(0.25, self.swipe_offset))
+        return True
     
-    def show_settings_menu(self):
-        """Display settings popup menu."""
-        if self.tap_count > 1:
-            return  # Double-tap, don't show menu
+    def on_touch_up(self, touch):
+        """Handle touch up - calculate swipe velocity."""
+        current_time = Clock.get_time()
+        delta_time = current_time - self.touch_start_time
         
-        content = BoxLayout(orientation='vertical', padding=10, spacing=10)
+        if delta_time > 0:
+            self.swipe_velocity = (touch.x - self.touch_start_x) / (delta_time * max(self.width, 1))
         
-        # Title
-        title = Label(text='Lunar Drift Settings', size_hint_y=0.1, bold=True)
-        content.add_widget(title)
+        return True
+    
+    def update(self, dt):
+        """Update animation, sensors, and physics each frame."""
+        # Update animation phases
+        self.pulse_phase += dt * self.pulse_speed * self.settings['animation_speed']
+        if self.pulse_phase >= 2 * math.pi:
+            self.pulse_phase -= 2 * math.pi
         
-        # Settings grid
-        settings_grid = GridLayout(cols=2, spacing=10, size_hint_y=0.8, padding=10)
+        # Update pulse glow
+        base_pulse = 1.0 + self.settings['glow_intensity'] * math.sin(self.pulse_phase)
+        self.pulse = base_pulse if self.animation_enabled else 1.0
         
-        # Brightness slider
-        settings_grid.add_widget(Label(text='Glow Intensity:', size_hint_x=0.4))
-        glow_slider = Slider(min=0.3, max=1.5, value=self.settings.get('glow_intensity', 1.0))
-        glow_slider.bind(value=self.on_glow_changed)
-        settings_grid.add_widget(glow_slider)
+        # Update double-tap animation
+        if self.double_tap_detected:
+            self.double_tap_timer -= dt
+            if self.double_tap_timer <= 0:
+                self.double_tap_detected = False
         
-        # Moon size slider
-        settings_grid.add_widget(Label(text='Moon Size:', size_hint_x=0.4))
-        size_slider = Slider(min=0.15, max=0.4, value=self.settings.get('moon_size', 0.25))
-        size_slider.bind(value=self.on_size_changed)
-        settings_grid.add_widget(size_slider)
+        # Update motion detection
+        self.motion_magnitude = self.sensor_manager.get_motion_magnitude()
+        self.motion_detected = self.motion_magnitude > self.motion_threshold
         
-        # Parallax toggle
-        settings_grid.add_widget(Label(text='Parallax Effect:', size_hint_x=0.4))
-        parallax_switch = Switch(active=self.settings.get('parallax_enabled', True))
-        parallax_switch.bind(active=self.on_parallax_toggled)
-        settings_grid.add_widget(parallax_switch)
+        # Update stability timer
+        if self.motion_detected:
+            self.stability_timer = 0.0
+        else:
+            self.stability_timer += dt
         
-        content.add_widget(settings_grid)
+        # Disable animation if stable for 3 seconds (save power)
+        self.animation_enabled = self.stability_timer < self.stability_threshold
         
-        # Close button
-        close_btn = Button(text='Close Settings', size_hint_y=0.1)
-        content.add_widget(close_btn)
+        # Decay swipe
+        self.swipe_offset += self.swipe_velocity * dt
+        self.swipe_velocity *= 0.95
         
-        self.settings_popup = Popup(
-            title='Lunar Drift Settings',
-            content=content,
-            size_hint=(0.9, 0.9)
+        if abs(self.swipe_offset) < 0.001:
+            self.swipe_offset = 0.0
+            self.swipe_velocity = 0.0
+        
+        # Update moon position based on sensors and swipe
+        parallax_strength = self.settings['parallax_strength']
+        self.moon_x = 0.5 + (self.sensor_manager.gyro_y * 0.1 * parallax_strength) + self.swipe_offset
+        self.moon_y = 0.5 - (self.sensor_manager.gyro_x * 0.1 * parallax_strength)
+        
+        # Clamp moon position
+        self.moon_x = max(0.1, min(0.9, self.moon_x))
+        self.moon_y = max(0.1, min(0.9, self.moon_y))
+        
+        # Redraw
+        self.redraw_canvas()
+    
+    def redraw_canvas(self):
+        """Render moon and background to canvas."""
+        self.canvas.clear()
+        
+        with self.canvas:
+            # Black space background
+            Color(0.02, 0.02, 0.05, 1)
+            Rectangle(pos=self.pos, size=self.size)
+            
+            # Starfield
+            if self.settings['show_stars']:
+                self._draw_stars()
+            
+            # Calculate moon position
+            moon_center_x = self.x + self.moon_x * self.width
+            moon_center_y = self.y + self.moon_y * self.height
+            moon_radius = self.moon_radius
+            
+            # Moon glow (if animated)
+            if self.animation_enabled:
+                glow_radius = moon_radius * self.pulse
+                Color(1, 1, 0.8, 0.15 * (1.5 - self.pulse) * self.settings['glow_intensity'])
+                Ellipse(
+                    pos=(moon_center_x - glow_radius, moon_center_y - glow_radius),
+                    size=(glow_radius * 2, glow_radius * 2)
+                )
+            
+            # Moon body
+            Color(0.95, 0.95, 0.85, 1)
+            Ellipse(
+                pos=(moon_center_x - moon_radius, moon_center_y - moon_radius),
+                size=(moon_radius * 2, moon_radius * 2)
+            )
+            
+            # Moon craters
+            Color(0.7, 0.7, 0.6, 1)
+            crater_positions = [
+                (0.3, 0.3, 0.15),
+                (0.6, 0.5, 0.1),
+                (0.4, 0.7, 0.12),
+                (0.2, 0.6, 0.08),
+            ]
+            for cx, cy, cr in crater_positions:
+                crater_x = moon_center_x - moon_radius + cx * moon_radius * 2
+                crater_y = moon_center_y - moon_radius + cy * moon_radius * 2
+                crater_r = cr * moon_radius
+                Ellipse(
+                    pos=(crater_x - crater_r, crater_y - crater_r),
+                    size=(crater_r * 2, crater_r * 2)
+                )
+            
+            # Double-tap pulse effect
+            if self.double_tap_detected:
+                pulse_size = 1.0 - (self.double_tap_timer / 0.5)
+                pulse_radius = moon_radius * (1.5 + pulse_size * 0.5)
+                Color(1, 0.8, 0.2, 0.5 * (1 - pulse_size))
+                Ellipse(
+                    pos=(moon_center_x - pulse_radius, moon_center_y - pulse_radius),
+                    size=(pulse_radius * 2, pulse_radius * 2)
+                )
+    
+    def _draw_stars(self):
+        """Draw starfield background."""
+        Color(1, 1, 1, 0.4)
+        star_seed = 42
+        for i in range(100):
+            star_x = (self.x + (i * 97 + star_seed) % int(self.width))
+            star_y = (self.y + (i * 71 + star_seed) % int(self.height))
+            size = 1 + (i % 3)
+            Ellipse(pos=(star_x, star_y), size=(size, size))
+
+
+class LunarDriftApp(App):
+    """Main application class for Lunar Drift."""
+    
+    def build(self):
+        """Build the app UI."""
+        Window.size = (720, 1280)
+        Window.bind(on_keyboard=self.on_keyboard)
+        
+        # Request Android permissions
+        if ANDROID_AVAILABLE:
+            self._request_permissions()
+        
+        # Create root layout
+        self.root = FloatLayout()
+        
+        # Add wallpaper widget
+        self.wallpaper = LunarDriftWallpaper()
+        self.root.add_widget(self.wallpaper)
+        
+        # Add UI overlay (settings button)
+        self._add_ui_overlay()
+        
+        return self.root
+    
+    def _add_ui_overlay(self):
+        """Add settings button to wallpaper."""
+        overlay = FloatLayout(size_hint=(1, 1))
+        
+        # Settings button
+        btn = Button(
+            text='Set as Wallpaper',
+            size_hint=(0.3, 0.08),
+            pos_hint={'right': 1, 'top': 1}
         )
+        btn.bind(on_press=self.on_set_wallpaper)
+        overlay.add_widget(btn)
         
-        close_btn.bind(on_press=self.settings_popup.dismiss)
-        self.settings_popup.open()
+        self.root.add_widget(overlay)
     
-    def on_glow_changed(self, instance, value):
-        """Update glow intensity setting."""
-        self.moon_renderer.glow_intensity = value
-        self.settings['glow_intensity'] = value
-        self.save_settings()
-    
-    def on_size_changed(self, instance, value):
-        """Update moon size setting."""
-        self.settings['moon_size'] = value
-        self.save_settings()
-    
-    def on_parallax_toggled(self, instance, value):
-        """Toggle parallax effect."""
-        self.settings['parallax_enabled'] = value
-        if not value:
-            self.moon_renderer.parallax_x = 0
-            self.moon_renderer.parallax_y = 0
-        self.save_settings()
-    
-    def apply_settings(self):
-        """Apply saved settings to the app."""
-        if self.moon_renderer:
-            self.moon_renderer.glow_intensity = self.settings.get('glow_intensity', 1.0)
-    
-    def load_settings(self):
-        """Load settings from file."""
-        settings_file = Path.home() / '.lunar_drift_settings.json'
-        if settings_file.exists():
+    def on_set_wallpaper(self, instance):
+        """Handle set wallpaper button press."""
+        if ANDROID_AVAILABLE:
             try:
-                with open(settings_file, 'r') as f:
-                    return json.load(f)
+                Intent = autoclass('android.content.Intent')
+                Settings = autoclass('android.provider.Settings')
+                
+                intent = Intent()
+                intent.setAction(Settings.ACTION_DISPLAY_SETTINGS)
+                
+                activity = PythonActivity.mActivity
+                activity.startActivity(intent)
             except Exception as e:
-                print(f"Error loading settings: {e}")
-        return {}
+                print(f"[ERROR] Failed to open wallpaper settings: {e}")
+        else:
+            print("[INFO] Running in desktop mode - wallpaper setting not available")
     
-    def save_settings(self):
-        """Save settings to file."""
+    def _request_permissions(self):
+        """Request necessary Android permissions."""
         try:
-            settings_file = Path.home() / '.lunar_drift_settings.json'
-            with open(settings_file, 'w') as f:
-                json.dump(self.settings, f)
+            permissions = [
+                Permission.BODY_SENSORS,
+            ]
+            request_permissions(permissions)
         except Exception as e:
-            print(f"Error saving settings: {e}")
+            print(f"[WARNING] Failed to request permissions: {e}")
+    
+    def on_keyboard(self, window, key, scancode, codepoint, modifier):
+        """Handle keyboard input."""
+        if key == 27:  # ESC
+            return True
+        return False
 
 
 if __name__ == '__main__':
